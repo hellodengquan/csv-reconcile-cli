@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: csv-reconcile
+Version: 0.1.0
+Summary: CSV 对账命令行工具：关键字段匹配、差异定位、缺失行报告
+Requires-Python: >=3.10
+Requires-Dist: typer>=0.12
+Requires-Dist: rich>=13.0
+Requires-Dist: pandas>=2.0

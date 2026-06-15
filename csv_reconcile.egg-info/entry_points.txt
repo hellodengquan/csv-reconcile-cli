@@ -1,0 +1,2 @@
+[console_scripts]
+csv-reconcile = csv_reconcile.cli:app
