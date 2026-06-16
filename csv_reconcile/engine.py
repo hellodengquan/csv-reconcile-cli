@@ -1,9 +1,26 @@
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
+
+_FULLWIDTH_PUNCT: dict[int, str] = {
+    0xFF01: "!", 0xFF03: "#", 0xFF04: "$", 0xFF05: "%", 0xFF06: "&",
+    0xFF08: "(", 0xFF09: ")", 0xFF0A: "*", 0xFF0B: "+", 0xFF0C: ",",
+    0xFF0E: ".", 0xFF0F: "/", 0xFF1A: ":", 0xFF1B: ";", 0xFF1C: "<",
+    0xFF1D: "=", 0xFF1E: ">", 0xFF1F: "?", 0xFF20: "@", 0xFF3B: "[",
+    0xFF3D: "]", 0xFF5B: "{", 0xFF5C: "|", 0xFF5D: "}", 0xFF5E: "~",
+}
+
+_CJK_PUNCT_MAP: dict[int, str] = {
+    0x3001: ",", 0x3002: ".", 0x300A: "<", 0x300B: ">",
+    0x300C: '"', 0x300D: '"', 0x300E: '"', 0x300F: '"',
+    0x3010: "[", 0x3011: "]", 0x3014: "(", 0x3015: ")",
+    0xFF01: "!", 0xFF08: "(", 0xFF09: ")", 0xFF0C: ",",
+    0xFF0E: ".", 0xFF1A: ":", 0xFF1B: ";", 0xFF1F: "?",
+}
 
 
 @dataclass
@@ -21,6 +38,23 @@ class RowDiff:
 
 
 @dataclass
+class ColumnMissingRate:
+    column: str
+    left_missing: int = 0
+    right_missing: int = 0
+    left_total: int = 0
+    right_total: int = 0
+
+    @property
+    def left_missing_rate(self) -> float:
+        return self.left_missing / self.left_total if self.left_total else 0.0
+
+    @property
+    def right_missing_rate(self) -> float:
+        return self.right_missing / self.right_total if self.right_total else 0.0
+
+
+@dataclass
 class ReconcileSummary:
     left_total: int = 0
     right_total: int = 0
@@ -28,6 +62,7 @@ class ReconcileSummary:
     diff_count: int = 0
     left_only_count: int = 0
     right_only_count: int = 0
+    column_missing_rates: list[ColumnMissingRate] = field(default_factory=list)
 
     @property
     def left_missing_rate(self) -> float:
@@ -50,8 +85,43 @@ class ReconcileResult:
     summary: ReconcileSummary = field(default_factory=ReconcileSummary)
 
 
+def _fullwidth_to_ascii(s: str) -> str:
+    return "".join(_FULLWIDTH_PUNCT.get(ord(c), c) for c in s)
+
+
+def _cjk_punct_to_ascii(s: str) -> str:
+    return "".join(_CJK_PUNCT_MAP.get(ord(c), c) for c in s)
+
+
 def _normalize_value(s: str) -> str:
-    return s.strip().casefold()
+    s = s.strip()
+    s = _fullwidth_to_ascii(s)
+    s = _cjk_punct_to_ascii(s)
+    s = unicodedata.normalize("NFC", s)
+    return s.casefold()
+
+
+def _estimate_row_bytes(path: Path, encoding: str = "utf-8") -> int:
+    sample_lines: list[str] = []
+    with open(path, encoding=encoding, errors="replace") as f:
+        for i, line in enumerate(f):
+            if i >= 10:
+                break
+            sample_lines.append(line)
+    if not sample_lines:
+        return 200
+    avg = sum(len(line.encode("utf-8", errors="replace")) for line in sample_lines) / len(sample_lines)
+    return max(100, int(avg))
+
+
+def _adaptive_chunksize(
+    path: Path,
+    memory_limit_mb: int,
+    encoding: str = "utf-8",
+) -> int:
+    row_bytes = _estimate_row_bytes(path, encoding)
+    chunk_rows = max(100, int(memory_limit_mb * 1024 * 1024 / row_bytes / 4))
+    return chunk_rows
 
 
 def _read_csv(
@@ -69,10 +139,8 @@ def _read_csv(
         read_kwargs["chunksize"] = chunksize
 
     if memory_limit_mb is not None and chunksize is None:
-        file_size_mb = path.stat().st_size / (1024 * 1024)
-        if file_size_mb > memory_limit_mb:
-            estimated_rows = max(1, int(1000 * memory_limit_mb / max(file_size_mb, 1)))
-            read_kwargs["chunksize"] = estimated_rows
+        adaptive = _adaptive_chunksize(path, memory_limit_mb, encoding)
+        read_kwargs["chunksize"] = adaptive
 
     if "chunksize" in read_kwargs:
         chunks: list[pd.DataFrame] = []
@@ -90,12 +158,24 @@ def _read_csv(
 def _make_key_series(
     df: pd.DataFrame,
     key_columns: list[str],
+    secondary_columns: list[str] | None = None,
     normalize: bool = False,
 ) -> pd.Series:
-    series = df[key_columns].astype(str)
+    primary = df[key_columns].astype(str)
     if normalize:
-        series = series.map(_normalize_value)
-    return series.agg("||".join, axis=1)
+        primary = primary.map(_normalize_value)
+    primary_key = primary.agg("||".join, axis=1)
+
+    if secondary_columns:
+        valid_secondary = [c for c in secondary_columns if c in df.columns]
+        if valid_secondary:
+            secondary = df[valid_secondary].astype(str)
+            if normalize:
+                secondary = secondary.map(_normalize_value)
+            secondary_key = secondary.agg("||".join, axis=1)
+            return primary_key + "@@" + secondary_key
+
+    return primary_key
 
 
 def _make_compare_series(
@@ -103,8 +183,29 @@ def _make_compare_series(
     normalize: bool = False,
 ) -> pd.Series:
     if normalize:
-        return series.astype(str).str.strip().str.casefold()
+        return series.astype(str).map(_normalize_value)
     return series.astype(str).str.strip()
+
+
+def _compute_column_missing_rates(
+    left_df: pd.DataFrame,
+    right_df: pd.DataFrame,
+    left_only_df: pd.DataFrame,
+    right_only_df: pd.DataFrame,
+    compare_columns: list[str],
+) -> list[ColumnMissingRate]:
+    rates: list[ColumnMissingRate] = []
+    for col in compare_columns:
+        left_missing = int(left_only_df[col].isna().sum()) + int((left_only_df[col].astype(str).str.strip() == "").sum()) if col in left_only_df.columns else left_only_df.shape[0]
+        right_missing = int(right_only_df[col].isna().sum()) + int((right_only_df[col].astype(str).str.strip() == "").sum()) if col in right_only_df.columns else right_only_df.shape[0]
+        rates.append(ColumnMissingRate(
+            column=col,
+            left_missing=left_missing,
+            right_missing=right_missing,
+            left_total=len(left_df),
+            right_total=len(right_df),
+        ))
+    return rates
 
 
 def reconcile(
@@ -112,6 +213,7 @@ def reconcile(
     right_path: Path,
     key_columns: list[str],
     compare_columns: list[str] | None = None,
+    secondary_keys: list[str] | None = None,
     encoding: str = "utf-8",
     normalize: bool = False,
     chunksize: int | None = None,
@@ -133,10 +235,6 @@ def reconcile(
             summary=ReconcileSummary(
                 left_total=0,
                 right_total=0,
-                matched_count=0,
-                diff_count=0,
-                left_only_count=0,
-                right_only_count=0,
             ),
         )
 
@@ -163,15 +261,19 @@ def reconcile(
         common_keys: set[str] = set()
         row_diffs: list[RowDiff] = []
         matched_count: int = 0
+        left_only_df = left_df.iloc[0:0]
+        right_only_df = right_df
     elif len(right_df) == 0:
         left_only = left_df.to_dict("records")
         right_only = []
         common_keys = set()
         row_diffs = []
         matched_count = 0
+        left_only_df = left_df
+        right_only_df = right_df.iloc[0:0]
     else:
-        left_key = _make_key_series(left_df, key_columns, normalize=normalize)
-        right_key = _make_key_series(right_df, key_columns, normalize=normalize)
+        left_key = _make_key_series(left_df, key_columns, secondary_keys, normalize=normalize)
+        right_key = _make_key_series(right_df, key_columns, secondary_keys, normalize=normalize)
 
         left_key_set = set(left_key)
         right_key_set = set(right_key)
@@ -179,8 +281,10 @@ def reconcile(
         left_only_mask = ~left_key.isin(right_key_set)
         right_only_mask = ~right_key.isin(left_key_set)
 
-        left_only = left_df.loc[left_only_mask].to_dict("records")
-        right_only = right_df.loc[right_only_mask].to_dict("records")
+        left_only_df = left_df.loc[left_only_mask]
+        right_only_df = right_df.loc[right_only_mask]
+        left_only = left_only_df.to_dict("records")
+        right_only = right_only_df.to_dict("records")
 
         common_keys = left_key_set & right_key_set
 
@@ -225,6 +329,10 @@ def reconcile(
             else:
                 matched_count += 1
 
+    col_missing_rates = _compute_column_missing_rates(
+        left_df, right_df, left_only_df, right_only_df, compare_columns
+    )
+
     summary = ReconcileSummary(
         left_total=len(left_df),
         right_total=len(right_df),
@@ -232,6 +340,7 @@ def reconcile(
         diff_count=len(row_diffs),
         left_only_count=len(left_only),
         right_only_count=len(right_only),
+        column_missing_rates=col_missing_rates,
     )
 
     return ReconcileResult(
@@ -249,6 +358,6 @@ def normalize_csv(
 ) -> None:
     df = _read_csv(input_path, encoding)
     for col in df.columns:
-        df[col] = df[col].astype(str).str.strip().str.casefold()
+        df[col] = df[col].astype(str).map(_normalize_value)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False, encoding="utf-8-sig")

@@ -1,7 +1,7 @@
 [project]
 name = "csv-reconcile"
-version = "0.1.0"
-description = "CSV 对账命令行工具：关键字段匹配、差异定位、缺失行报告"
+version = "0.2.0"
+description = "CSV \u5bf9\u8d26\u547d\u4ee4\u884c\u5de5\u5177: \u5173\u952e\u5b57\u6bb5\u5339\u914d\u3001\u5dee\u5f02\u5b9a\u4f4d\u3001\u7f3a\u5931\u884c\u62a5\u544a"
 requires-python = ">=3.10"
 dependencies = [
     "typer>=0.12",

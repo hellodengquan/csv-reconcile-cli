@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import pandas as pd
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from .engine import ReconcileResult
 
@@ -17,6 +19,24 @@ def _fmt_key(key_values: dict[str, str]) -> str:
 
 def _fmt_pct(value: float) -> str:
     return f"{value:.2%}"
+
+
+def _highlight_diff(left: str, right: str) -> tuple[Text, Text]:
+    sm = SequenceMatcher(None, left, right)
+    left_text = Text()
+    right_text = Text()
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            left_text.append(left[i1:i2])
+            right_text.append(right[j1:j2])
+        elif tag == "replace":
+            left_text.append(left[i1:i2], style="bold red")
+            right_text.append(right[j1:j2], style="bold green")
+        elif tag == "delete":
+            left_text.append(left[i1:i2], style="bold red on #3a1515")
+        elif tag == "insert":
+            right_text.append(right[j1:j2], style="bold green on #153a15")
+    return left_text, right_text
 
 
 def print_summary(result: ReconcileResult, left_name: str, right_name: str) -> None:
@@ -40,6 +60,23 @@ def print_summary(result: ReconcileResult, left_name: str, right_name: str) -> N
     console.print(table)
     console.print()
 
+    if s.column_missing_rates:
+        console.rule("[bold cyan]\u6309\u5217\u7f3a\u5931\u7387[/bold cyan]")
+        col_table = Table(show_header=True, header_style="bold magenta")
+        col_table.add_column("\u5b57\u6bb5", style="cyan")
+        col_table.add_column(f"{left_name} \u7f3a\u5931\u7387", justify="right")
+        col_table.add_column(f"{right_name} \u7f3a\u5931\u7387", justify="right")
+
+        for cmr in s.column_missing_rates:
+            col_table.add_row(
+                cmr.column,
+                _fmt_pct(cmr.left_missing_rate),
+                _fmt_pct(cmr.right_missing_rate),
+            )
+
+        console.print(col_table)
+        console.print()
+
 
 def print_diffs(result: ReconcileResult, left_name: str, right_name: str) -> None:
     if not result.row_diffs:
@@ -56,11 +93,12 @@ def print_diffs(result: ReconcileResult, left_name: str, right_name: str) -> Non
         )
         table.add_column("\u5b57\u6bb5")
         table.add_column("\u5dee\u5f02\u7c7b\u578b")
-        table.add_column(left_name, style="cyan")
-        table.add_column(right_name, style="magenta")
+        table.add_column(left_name)
+        table.add_column(right_name)
 
         for d in rd.diffs:
-            table.add_row(d.column, d.diff_type, d.left_value, d.right_value)
+            left_text, right_text = _highlight_diff(d.left_value, d.right_value)
+            table.add_row(d.column, d.diff_type, left_text, right_text)
 
         console.print(table)
         console.print()
@@ -130,6 +168,19 @@ def export_csv(result: ReconcileResult, output_dir: Path) -> None:
     ]
     df_summary = pd.DataFrame(summary_data, columns=["\u6307\u6807", "\u503c"])
     df_summary.to_csv(output_dir / "summary.csv", index=False, encoding="utf-8-sig")
+
+    if s.column_missing_rates:
+        cmr_rows = []
+        for cmr in s.column_missing_rates:
+            cmr_rows.append({
+                "\u5b57\u6bb5": cmr.column,
+                f"{cmr.column}_{cmr.column}_left_missing": cmr.left_missing,
+                f"{cmr.column}_{cmr.column}_right_missing": cmr.right_missing,
+                "\u5de6\u8868\u7f3a\u5931\u7387": _fmt_pct(cmr.left_missing_rate),
+                "\u53f3\u8868\u7f3a\u5931\u7387": _fmt_pct(cmr.right_missing_rate),
+            })
+        df_cmr = pd.DataFrame(cmr_rows)
+        df_cmr.to_csv(output_dir / "column_missing_rates.csv", index=False, encoding="utf-8-sig")
 
 
 def print_report(
