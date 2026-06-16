@@ -2,6 +2,7 @@ pyproject.toml
 csv_reconcile/__init__.py
 csv_reconcile/cli.py
 csv_reconcile/engine.py
+csv_reconcile/html_report.py
 csv_reconcile/report.py
 csv_reconcile/sql.py
 csv_reconcile.egg-info/PKG-INFO

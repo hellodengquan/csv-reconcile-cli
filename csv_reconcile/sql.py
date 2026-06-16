@@ -63,8 +63,13 @@ def generate_fix_sql(
     key_columns: list[str],
     generate_inserts: bool = True,
     generate_deletes: bool = True,
+    use_transaction: bool = True,
 ) -> str:
     parts: list[str] = []
+
+    if use_transaction:
+        parts.append("BEGIN TRANSACTION;")
+        parts.append("")
 
     update_stmts = _generate_update_statements(result, table_name, key_columns)
     if update_stmts:
@@ -86,8 +91,11 @@ def generate_fix_sql(
             parts.extend(delete_stmts)
             parts.append("")
 
-    if not parts:
+    if not parts or (len(parts) == 2 and parts[0] == "BEGIN TRANSACTION;"):
         parts.append("-- No differences found; no SQL to generate.")
+
+    if use_transaction:
+        parts.append("COMMIT;")
 
     return "\n".join(parts)
 
@@ -99,7 +107,15 @@ def export_fix_sql(
     key_columns: list[str],
     generate_inserts: bool = True,
     generate_deletes: bool = True,
+    use_transaction: bool = True,
 ) -> None:
-    sql = generate_fix_sql(result, table_name, key_columns, generate_inserts, generate_deletes)
+    sql = generate_fix_sql(
+        result,
+        table_name,
+        key_columns,
+        generate_inserts,
+        generate_deletes,
+        use_transaction,
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(sql, encoding="utf-8")

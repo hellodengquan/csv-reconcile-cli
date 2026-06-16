@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import platform
+import re
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +23,69 @@ _CJK_PUNCT_MAP: dict[int, str] = {
     0xFF01: "!", 0xFF08: "(", 0xFF09: ")", 0xFF0C: ",",
     0xFF0E: ".", 0xFF1A: ":", 0xFF1B: ";", 0xFF1F: "?",
 }
+
+_ZERO_WIDTH_CHARS: set[str] = {
+    "\u200b",  # zero-width space
+    "\u200c",  # zero-width non-joiner
+    "\u200d",  # zero-width joiner
+    "\ufeff",  # zero-width no-break space (BOM)
+    "\u2060",  # word joiner
+    "\u180e",  # mongolian vowel separator
+    "\u00ad",  # soft hyphen
+}
+
+_BOM_CHARS: set[str] = {
+    "\ufeff",
+}
+
+_INT_RE = re.compile(r"^-?\d+$")
+_FLOAT_RE = re.compile(r"^-?\d+\.\d+$")
+_DATE_RE = re.compile(
+    r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?$"
+)
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$", re.I
+)
+_EMAIL_RE = re.compile(r"^[\w.+-]+@[\w-]+\.[\w.-]+$", re.I)
+
+
+@dataclass
+class ColumnWeight:
+    column: str
+    unique_ratio: float = 0.0
+    null_ratio: float = 0.0
+    avg_length: float = 0.0
+    data_type: str = "string"
+    score: float = 0.0
+
+
+@dataclass
+class DataTypeDistribution:
+    column: str
+    int_count: int = 0
+    float_count: int = 0
+    date_count: int = 0
+    uuid_count: int = 0
+    email_count: int = 0
+    string_count: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.int_count + self.float_count + self.date_count + self.uuid_count + self.email_count + self.string_count
+
+    @property
+    def dominant_type(self) -> str:
+        if self.total == 0:
+            return "string"
+        types = [
+            ("int", self.int_count),
+            ("float", self.float_count),
+            ("date", self.date_count),
+            ("uuid", self.uuid_count),
+            ("email", self.email_count),
+            ("string", self.string_count),
+        ]
+        return max(types, key=lambda t: t[1])[0]
 
 
 @dataclass
@@ -44,6 +109,8 @@ class ColumnMissingRate:
     right_missing: int = 0
     left_total: int = 0
     right_total: int = 0
+    left_distribution: DataTypeDistribution | None = None
+    right_distribution: DataTypeDistribution | None = None
 
     @property
     def left_missing_rate(self) -> float:
@@ -85,6 +152,19 @@ class ReconcileResult:
     summary: ReconcileSummary = field(default_factory=ReconcileSummary)
 
 
+def _remove_zero_width(s: str) -> str:
+    return "".join(c for c in s if c not in _ZERO_WIDTH_CHARS)
+
+
+def _remove_bom(s: str) -> str:
+    for bom in _BOM_CHARS:
+        if s.startswith(bom):
+            s = s[len(bom):]
+        if s.endswith(bom):
+            s = s[:-len(bom)]
+    return s
+
+
 def _fullwidth_to_ascii(s: str) -> str:
     return "".join(_FULLWIDTH_PUNCT.get(ord(c), c) for c in s)
 
@@ -94,11 +174,65 @@ def _cjk_punct_to_ascii(s: str) -> str:
 
 
 def _normalize_value(s: str) -> str:
+    s = _remove_bom(s)
+    s = _remove_zero_width(s)
     s = s.strip()
     s = _fullwidth_to_ascii(s)
     s = _cjk_punct_to_ascii(s)
     s = unicodedata.normalize("NFC", s)
     return s.casefold()
+
+
+def _classify_value(s: str) -> str:
+    s = s.strip()
+    if not s:
+        return "string"
+    if _INT_RE.match(s):
+        return "int"
+    if _FLOAT_RE.match(s):
+        return "float"
+    if _DATE_RE.match(s):
+        return "date"
+    if _UUID_RE.match(s):
+        return "uuid"
+    if _EMAIL_RE.match(s):
+        return "email"
+    return "string"
+
+
+def _compute_data_distribution(series: pd.Series) -> DataTypeDistribution:
+    col = series.name or "unknown"
+    dist = DataTypeDistribution(column=col)
+    for val in series.astype(str):
+        vtype = _classify_value(val)
+        if vtype == "int":
+            dist.int_count += 1
+        elif vtype == "float":
+            dist.float_count += 1
+        elif vtype == "date":
+            dist.date_count += 1
+        elif vtype == "uuid":
+            dist.uuid_count += 1
+        elif vtype == "email":
+            dist.email_count += 1
+        else:
+            dist.string_count += 1
+    return dist
+
+
+def _get_memory_info() -> tuple[int, int]:
+    system = platform.system()
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        return int(mem.total / (1024 * 1024)), int(mem.available / (1024 * 1024))
+    except Exception:
+        if system == "Darwin":
+            with open("/usr/bin/vm_stat"):
+                pass
+        total = 16 * 1024
+        available = 4 * 1024
+        return total, available
 
 
 def _estimate_row_bytes(path: Path, encoding: str = "utf-8") -> int:
@@ -120,7 +254,9 @@ def _adaptive_chunksize(
     encoding: str = "utf-8",
 ) -> int:
     row_bytes = _estimate_row_bytes(path, encoding)
-    chunk_rows = max(100, int(memory_limit_mb * 1024 * 1024 / row_bytes / 4))
+    _total_mem, available_mem = _get_memory_info()
+    safe_limit = min(memory_limit_mb, int(available_mem * 0.75))
+    chunk_rows = max(100, int(safe_limit * 1024 * 1024 / row_bytes / 4))
     return chunk_rows
 
 
@@ -196,16 +332,97 @@ def _compute_column_missing_rates(
 ) -> list[ColumnMissingRate]:
     rates: list[ColumnMissingRate] = []
     for col in compare_columns:
-        left_missing = int(left_only_df[col].isna().sum()) + int((left_only_df[col].astype(str).str.strip() == "").sum()) if col in left_only_df.columns else left_only_df.shape[0]
-        right_missing = int(right_only_df[col].isna().sum()) + int((right_only_df[col].astype(str).str.strip() == "").sum()) if col in right_only_df.columns else right_only_df.shape[0]
+        if col in left_only_df.columns:
+            left_series = left_only_df[col].astype(str)
+            left_missing = int((left_series.str.strip() == "").sum() + left_series.isna().sum())
+            left_dist = _compute_data_distribution(left_df[col])
+        else:
+            left_missing = left_only_df.shape[0]
+            left_dist = None
+
+        if col in right_only_df.columns:
+            right_series = right_only_df[col].astype(str)
+            right_missing = int((right_series.str.strip() == "").sum() + right_series.isna().sum())
+            right_dist = _compute_data_distribution(right_df[col])
+        else:
+            right_missing = right_only_df.shape[0]
+            right_dist = None
+
         rates.append(ColumnMissingRate(
             column=col,
             left_missing=left_missing,
             right_missing=right_missing,
             left_total=len(left_df),
             right_total=len(right_df),
+            left_distribution=left_dist,
+            right_distribution=right_dist,
         ))
     return rates
+
+
+def recommend_key_columns(
+    path: Path,
+    encoding: str = "utf-8",
+    top_n: int = 5,
+) -> list[ColumnWeight]:
+    df = _read_csv(path, encoding)
+    if df.empty and len(df.columns) == 0:
+        return []
+
+    total_rows = len(df)
+    weights: list[ColumnWeight] = []
+
+    for col in df.columns:
+        series = df[col].astype(str)
+        stripped = series.str.strip()
+        unique_ratio = float(stripped.nunique()) / total_rows if total_rows else 0.0
+        null_ratio = float((stripped == "").sum() + series.isna().sum()) / total_rows if total_rows else 0.0
+        avg_length = float(stripped.str.len().mean()) if total_rows else 0.0
+        dist = _compute_data_distribution(series)
+        data_type = dist.dominant_type
+
+        type_bonus = 1.0
+        if data_type == "uuid":
+            type_bonus = 1.8
+        elif data_type == "int":
+            type_bonus = 1.4
+        elif data_type == "email":
+            type_bonus = 1.1
+
+        length_factor = 1.0 + min(1.0, avg_length / 30.0)
+
+        is_consecutive = False
+        if data_type == "int" and total_rows >= 2:
+            try:
+                nums = pd.to_numeric(stripped, errors="coerce").dropna().astype(int)
+                if len(nums) >= 2:
+                    diff = nums.diff().dropna()
+                    if (diff == diff.iloc[0]).all() and diff.iloc[0] in (1, -1):
+                        is_consecutive = True
+            except Exception:
+                pass
+
+        consecutive_bonus = 1.2 if is_consecutive else 1.0
+
+        score = (
+            unique_ratio
+            * (1.0 - null_ratio)
+            * type_bonus
+            * length_factor
+            * consecutive_bonus
+        )
+
+        weights.append(ColumnWeight(
+            column=col,
+            unique_ratio=unique_ratio,
+            null_ratio=null_ratio,
+            avg_length=avg_length,
+            data_type=data_type,
+            score=score,
+        ))
+
+    weights.sort(key=lambda w: w.score, reverse=True)
+    return weights[:top_n]
 
 
 def reconcile(

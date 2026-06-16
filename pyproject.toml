@@ -1,12 +1,13 @@
 [project]
 name = "csv-reconcile"
-version = "0.2.0"
-description = "CSV \u5bf9\u8d26\u547d\u4ee4\u884c\u5de5\u5177: \u5173\u952e\u5b57\u6bb5\u5339\u914d\u3001\u5dee\u5f02\u5b9a\u4f4d\u3001\u7f3a\u5931\u884c\u62a5\u544a"
+version = "0.3.0"
+description = "CSV \u5bf9\u8d26\u547d\u4ee4\u884c\u5de5\u5177: \u5173\u952e\u5b57\u6bb5\u5339\u914d\u3001\u5dee\u5f02\u5b9a\u4f4d\u3001\u7f3a\u5931\u884c\u62a5\u544a\u3001SQL \u91cd\u6574"
 requires-python = ">=3.10"
 dependencies = [
     "typer>=0.12",
     "rich>=13.0",
     "pandas>=2.0",
+    "jinja2>=3.0",
 ]
 
 [project.optional-dependencies]
@@ -14,6 +15,7 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.5",
     "mypy>=1.10",
+    "psutil>=5.9",
 ]
 
 [project.scripts]
@@ -41,8 +43,13 @@ warn_unused_configs = true
 disallow_untyped_defs = true
 
 [[tool.mypy.overrides]]
-module = ["pandas", "rich.*"]
+module = ["pandas", "rich.*", "psutil"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.1.0",
+]

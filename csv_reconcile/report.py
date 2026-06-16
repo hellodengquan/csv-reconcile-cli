@@ -21,6 +21,18 @@ def _fmt_pct(value: float) -> str:
     return f"{value:.2%}"
 
 
+def _fmt_distribution(dist) -> str:  # type: ignore[no-untyped-def]
+    if dist is None:
+        return "-"
+    total = max(1, dist.total)
+    parts: list[str] = []
+    for tname in ["int", "float", "date", "uuid", "email", "string"]:
+        cnt = getattr(dist, f"{tname}_count")
+        if cnt > 0:
+            parts.append(f"[magenta]{tname}[/magenta]:{cnt / total * 100:.1f}%")
+    return ", ".join(parts)
+
+
 def _highlight_diff(left: str, right: str) -> tuple[Text, Text]:
     sm = SequenceMatcher(None, left, right)
     left_text = Text()
@@ -61,17 +73,23 @@ def print_summary(result: ReconcileResult, left_name: str, right_name: str) -> N
     console.print()
 
     if s.column_missing_rates:
-        console.rule("[bold cyan]\u6309\u5217\u7f3a\u5931\u7387[/bold cyan]")
+        console.rule("[bold cyan]\u6309\u5217\u7f3a\u5931\u7387 & \u6570\u636e\u7c7b\u578b\u5206\u5e03[/bold cyan]")
         col_table = Table(show_header=True, header_style="bold magenta")
         col_table.add_column("\u5b57\u6bb5", style="cyan")
         col_table.add_column(f"{left_name} \u7f3a\u5931\u7387", justify="right")
         col_table.add_column(f"{right_name} \u7f3a\u5931\u7387", justify="right")
+        col_table.add_column(f"{left_name} \u7c7b\u578b\u5206\u5e03")
+        col_table.add_column(f"{right_name} \u7c7b\u578b\u5206\u5e03")
 
         for cmr in s.column_missing_rates:
+            left_dist = _fmt_distribution(cmr.left_distribution)
+            right_dist = _fmt_distribution(cmr.right_distribution)
             col_table.add_row(
                 cmr.column,
                 _fmt_pct(cmr.left_missing_rate),
                 _fmt_pct(cmr.right_missing_rate),
+                left_dist,
+                right_dist,
             )
 
         console.print(col_table)

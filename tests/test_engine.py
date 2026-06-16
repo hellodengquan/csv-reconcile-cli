@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from csv_reconcile.engine import _normalize_value, normalize_csv, reconcile
+from csv_reconcile.engine import _normalize_value, normalize_csv, recommend_key_columns, reconcile
+from csv_reconcile.html_report import generate_html
 from csv_reconcile.sql import generate_fix_sql
 
 
@@ -436,3 +437,288 @@ order_id,name
         result = reconcile(left, right, key_columns=["order_id"])
         sql = generate_fix_sql(result, "orders", ["order_id"])
         assert "No differences found" in sql
+
+    def test_transaction_boundaries(self, tmp_path: Path) -> None:
+        left = _write_csv(tmp_path, "left.csv", BASIC_LEFT)
+        right = _write_csv(tmp_path, "right.csv", BASIC_RIGHT)
+        result = reconcile(left, right, key_columns=["order_id", "item_id"])
+        sql = generate_fix_sql(result, "orders", ["order_id", "item_id"])
+        assert sql.startswith("BEGIN TRANSACTION;")
+        assert "COMMIT;" in sql
+
+    def test_no_transaction_flag(self, tmp_path: Path) -> None:
+        left = _write_csv(tmp_path, "left.csv", BASIC_LEFT)
+        right = _write_csv(tmp_path, "right.csv", BASIC_RIGHT)
+        result = reconcile(left, right, key_columns=["order_id", "item_id"])
+        sql = generate_fix_sql(result, "orders", ["order_id", "item_id"], use_transaction=False)
+        assert "BEGIN TRANSACTION" not in sql
+        assert "COMMIT" not in sql
+        assert "UPDATE orders" in sql
+
+    def test_delete_statements_complete(self, tmp_path: Path) -> None:
+        left_content = "id,name\n1,Alice\n2,Bob\n"
+        right_content = "id,name\n1,Alice\n"
+        left = _write_csv(tmp_path, "left.csv", left_content)
+        right = _write_csv(tmp_path, "right.csv", right_content)
+        result = reconcile(left, right, key_columns=["id"])
+        sql = generate_fix_sql(result, "users", ["id"])
+        assert "DELETE FROM users WHERE id = '2';" in sql
+        assert "BEGIN TRANSACTION;" in sql
+        assert "COMMIT;" in sql
+
+
+class TestQuotedNestedQuotes:
+    def test_quoted_with_escaped_quotes(self, tmp_path: Path) -> None:
+        left_content = (
+            'order_id,description\n'
+            '1001,"He said ""hello"" to me"\n'
+        )
+        right_content = (
+            'order_id,description\n'
+            '1001,"He said ""hello"" to me"\n'
+        )
+        left = tmp_path / "left.csv"
+        left.write_text(left_content, encoding="utf-8")
+        right = tmp_path / "right.csv"
+        right.write_text(right_content, encoding="utf-8")
+        result = reconcile(left, right, key_columns=["order_id"])
+        assert result.summary.matched_count == 1
+        assert result.row_diffs == []
+
+    def test_quoted_nested_quotes_mismatch(self, tmp_path: Path) -> None:
+        left_content = (
+            'order_id,description\n'
+            '1001,"He said ""hello"" to me"\n'
+        )
+        right_content = (
+            'order_id,description\n'
+            '1001,"He said ""hi"" to me"\n'
+        )
+        left = tmp_path / "left.csv"
+        left.write_text(left_content, encoding="utf-8")
+        right = tmp_path / "right.csv"
+        right.write_text(right_content, encoding="utf-8")
+        result = reconcile(left, right, key_columns=["order_id"])
+        assert result.summary.diff_count == 1
+        assert "hello" in result.row_diffs[0].diffs[0].left_value
+        assert "hi" in result.row_diffs[0].diffs[0].right_value
+
+    def test_quoted_multiple_escaped_quotes(self, tmp_path: Path) -> None:
+        left_content = (
+            'id,notes\n'
+            '1,"""quote"" and ""quote"""\n'
+        )
+        right_content = (
+            'id,notes\n'
+            '1,"""quote"" and ""quote"""\n'
+        )
+        left = tmp_path / "left.csv"
+        left.write_text(left_content, encoding="utf-8")
+        right = tmp_path / "right.csv"
+        right.write_text(right_content, encoding="utf-8")
+        result = reconcile(left, right, key_columns=["id"])
+        assert result.summary.matched_count == 1
+
+
+class TestZeroWidthAndBOM:
+    def test_normalize_removes_bom(self) -> None:
+        s = "\ufeffHello World"
+        assert _normalize_value(s) == "hello world"
+
+    def test_normalize_removes_zero_width_space(self) -> None:
+        s = "Hello\u200bWorld"
+        assert _normalize_value(s) == "helloworld"
+
+    def test_normalize_removes_zwj(self) -> None:
+        s = "A\u200dB\u200dC"
+        assert _normalize_value(s) == "abc"
+
+    def test_normalize_removes_soft_hyphen(self) -> None:
+        s = "prod\u00aduct"
+        assert _normalize_value(s) == "product"
+
+    def test_normalize_removes_mongolian_vowel(self) -> None:
+        s = "test\u180evalue"
+        assert _normalize_value(s) == "testvalue"
+
+    def test_normalize_removes_word_joiner(self) -> None:
+        s = "foo\u2060bar"
+        assert _normalize_value(s) == "foobar"
+
+    def test_csv_with_bom_header(self, tmp_path: Path) -> None:
+        left_content = "\ufefforder_id,product\n1001,Widget\n"
+        right_content = "order_id,product\n1001,Widget\n"
+        left = tmp_path / "left.csv"
+        left.write_text(left_content, encoding="utf-8")
+        right = tmp_path / "right.csv"
+        right.write_text(right_content, encoding="utf-8")
+        result = reconcile(left, right, key_columns=["order_id"], normalize=True)
+        assert result.summary.matched_count == 1
+
+    def test_csv_with_zero_width_in_value(self, tmp_path: Path) -> None:
+        left_content = "id,name\n1,John\u200bDoe\n"
+        right_content = "id,name\n1,JohnDoe\n"
+        left = tmp_path / "left.csv"
+        left.write_text(left_content, encoding="utf-8")
+        right = tmp_path / "right.csv"
+        right.write_text(right_content, encoding="utf-8")
+        result = reconcile(left, right, key_columns=["id"], normalize=True)
+        assert result.summary.matched_count == 1
+
+    def test_zero_width_in_key_column(self, tmp_path: Path) -> None:
+        left_content = "id,name\n1001\u200b,Widget\n"
+        right_content = "id,name\n1001,Widget\n"
+        left = tmp_path / "left.csv"
+        left.write_text(left_content, encoding="utf-8")
+        right = tmp_path / "right.csv"
+        right.write_text(right_content, encoding="utf-8")
+        result = reconcile(left, right, key_columns=["id"], normalize=True)
+        assert result.summary.matched_count == 1
+
+
+class TestColumnMissingRatesWithDistribution:
+    def test_column_missing_with_distribution(self, tmp_path: Path) -> None:
+        left = _write_csv(tmp_path, "left.csv", BASIC_LEFT)
+        right = _write_csv(tmp_path, "right.csv", BASIC_RIGHT)
+        result = reconcile(left, right, key_columns=["order_id", "item_id"])
+        assert len(result.summary.column_missing_rates) > 0
+        for cmr in result.summary.column_missing_rates:
+            assert cmr.left_distribution is not None
+            assert cmr.right_distribution is not None
+            assert cmr.left_distribution.dominant_type in ("int", "float", "string")
+            assert cmr.right_distribution.dominant_type in ("int", "float", "string")
+
+    def test_mixed_data_type_distribution(self, tmp_path: Path) -> None:
+        left_content = """\
+id,value
+1,123
+2,abc
+3,45.67
+4,2024-01-15
+5,user@example.com
+6,550e8400-e29b-41d4-a716-446655440000
+"""
+        right_content = left_content
+        left = _write_csv(tmp_path, "left.csv", left_content)
+        right = _write_csv(tmp_path, "right.csv", right_content)
+        result = reconcile(left, right, key_columns=["id"])
+        cmr_value = next(c for c in result.summary.column_missing_rates if c.column == "value")
+        assert cmr_value.left_distribution is not None
+        assert cmr_value.left_distribution.int_count >= 1
+        assert cmr_value.left_distribution.float_count >= 1
+        assert cmr_value.left_distribution.date_count >= 1
+        assert cmr_value.left_distribution.email_count >= 1
+        assert cmr_value.left_distribution.uuid_count >= 1
+        assert cmr_value.left_distribution.string_count >= 1
+
+
+class TestRecommendKeyColumns:
+    def test_recommend_basic(self, tmp_path: Path) -> None:
+        content = """\
+id,name,email,category,score
+1,Alice,alice@x.com,A,95
+2,Bob,bob@x.com,B,87
+3,Charlie,charlie@x.com,A,92
+4,Dave,dave@x.com,C,88
+"""
+        p = _write_csv(tmp_path, "data.csv", content)
+        weights = recommend_key_columns(p, top_n=3)
+        assert len(weights) == 3
+        assert weights[0].column == "id"
+        assert weights[0].unique_ratio == 1.0
+        assert weights[0].score > 0
+
+    def test_recommend_uuid_scores_high(self, tmp_path: Path) -> None:
+        content = """\
+user_id,name,note
+550e8400-e29b-41d4-a716-446655440000,Alice,xxx
+550e8400-e29b-41d4-a716-446655440001,Bob,yyy
+"""
+        p = _write_csv(tmp_path, "data.csv", content)
+        weights = recommend_key_columns(p, top_n=2)
+        assert weights[0].column == "user_id"
+        assert weights[0].data_type == "uuid"
+
+    def test_recommend_empty_file(self, tmp_path: Path) -> None:
+        content = "a,b,c\n"
+        p = _write_csv(tmp_path, "empty.csv", content)
+        weights = recommend_key_columns(p)
+        assert len(weights) == 3
+        for w in weights:
+            assert w.unique_ratio == 0.0
+
+    def test_recommend_with_nulls(self, tmp_path: Path) -> None:
+        content = """\
+id,code,name
+1,,A
+2,X002,B
+3,X003,
+4,X004,D
+"""
+        p = _write_csv(tmp_path, "data.csv", content)
+        weights = recommend_key_columns(p, top_n=3)
+        assert weights[0].column == "id"
+        assert weights[0].null_ratio == 0.0
+
+
+class TestAdaptiveChunkAndMemory:
+    def test_memory_limit_triggers_chunked_read(self, tmp_path: Path) -> None:
+        left = _write_csv(tmp_path, "left.csv", BASIC_LEFT)
+        right = _write_csv(tmp_path, "right.csv", BASIC_RIGHT)
+        result = reconcile(left, right, key_columns=["order_id", "item_id"], memory_limit_mb=64)
+        assert result.summary.left_total == 6
+        assert result.summary.right_total == 6
+
+    def test_explicit_chunksize(self, tmp_path: Path) -> None:
+        left = _write_csv(tmp_path, "left.csv", BASIC_LEFT)
+        right = _write_csv(tmp_path, "right.csv", BASIC_RIGHT)
+        result = reconcile(left, right, key_columns=["order_id", "item_id"], chunksize=2)
+        assert result.summary.matched_count == 3
+
+    def test_get_memory_info(self) -> None:
+        from csv_reconcile.engine import _get_memory_info
+        total, available = _get_memory_info()
+        assert total > 0
+        assert available > 0
+
+
+class TestHtmlReport:
+    def test_generate_html_light(self, tmp_path: Path) -> None:
+        left = _write_csv(tmp_path, "left.csv", BASIC_LEFT)
+        right = _write_csv(tmp_path, "right.csv", BASIC_RIGHT)
+        result = reconcile(left, right, key_columns=["order_id", "item_id"])
+        html = generate_html(result, theme="light")
+        assert "<!DOCTYPE html>" in html
+        assert "Matched" in html
+        assert "Only in Left" in html
+        assert "Value Differences" in html
+
+    def test_generate_html_dark(self, tmp_path: Path) -> None:
+        left = _write_csv(tmp_path, "left.csv", BASIC_LEFT)
+        right = _write_csv(tmp_path, "right.csv", BASIC_RIGHT)
+        result = reconcile(left, right, key_columns=["order_id", "item_id"])
+        html = generate_html(result, theme="dark")
+        assert "#111827" in html or "111827" in html
+
+    def test_generate_html_solarized(self, tmp_path: Path) -> None:
+        left = _write_csv(tmp_path, "left.csv", BASIC_LEFT)
+        right = _write_csv(tmp_path, "right.csv", BASIC_RIGHT)
+        result = reconcile(left, right, key_columns=["order_id", "item_id"])
+        html = generate_html(result, theme="solarized")
+        assert "#002b36" in html or "002b36" in html
+
+    def test_html_contains_theme_switcher(self, tmp_path: Path) -> None:
+        left = _write_csv(tmp_path, "left.csv", BASIC_LEFT)
+        right = _write_csv(tmp_path, "right.csv", BASIC_RIGHT)
+        result = reconcile(left, right, key_columns=["order_id", "item_id"])
+        html = generate_html(result)
+        assert "themeSwitcher" in html
+        assert "data-theme" in html
+
+    def test_html_contains_data_type_distribution(self, tmp_path: Path) -> None:
+        left = _write_csv(tmp_path, "left.csv", BASIC_LEFT)
+        right = _write_csv(tmp_path, "right.csv", BASIC_RIGHT)
+        result = reconcile(left, right, key_columns=["order_id", "item_id"])
+        html = generate_html(result)
+        assert "Data Type Distribution" in html
+        assert "int:" in html or "float:" in html
