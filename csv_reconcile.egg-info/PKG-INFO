@@ -6,3 +6,7 @@ Requires-Python: >=3.10
 Requires-Dist: typer>=0.12
 Requires-Dist: rich>=13.0
 Requires-Dist: pandas>=2.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: ruff>=0.5; extra == "dev"
+Requires-Dist: mypy>=1.10; extra == "dev"
