@@ -32,6 +32,9 @@ _ZERO_WIDTH_CHARS: set[str] = {
     "\u2060",  # word joiner
     "\u180e",  # mongolian vowel separator
     "\u00ad",  # soft hyphen
+    "\u200e",  # left-to-right mark (LRM)
+    "\u200f",  # right-to-left mark (RLM)
+    "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",  # bidirectional control
 }
 
 _BOM_CHARS: set[str] = {
@@ -43,10 +46,12 @@ _FLOAT_RE = re.compile(r"^-?\d+\.\d+$")
 _DATE_RE = re.compile(
     r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?$"
 )
+_TIMESTAMP_RE = re.compile(r"^\d{10}$|^\d{13}$")
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$", re.I
 )
 _EMAIL_RE = re.compile(r"^[\w.+-]+@[\w-]+\.[\w.-]+$", re.I)
+_MIN_SAMPLE_ROWS = 30
 
 
 @dataclass
@@ -57,6 +62,7 @@ class ColumnWeight:
     avg_length: float = 0.0
     data_type: str = "string"
     score: float = 0.0
+    is_uniform_fallback: bool = False
 
 
 @dataclass
@@ -65,13 +71,24 @@ class DataTypeDistribution:
     int_count: int = 0
     float_count: int = 0
     date_count: int = 0
+    timestamp_count: int = 0
     uuid_count: int = 0
     email_count: int = 0
+    enum_count: int = 0
     string_count: int = 0
 
     @property
     def total(self) -> int:
-        return self.int_count + self.float_count + self.date_count + self.uuid_count + self.email_count + self.string_count
+        return (
+            self.int_count
+            + self.float_count
+            + self.date_count
+            + self.timestamp_count
+            + self.uuid_count
+            + self.email_count
+            + self.enum_count
+            + self.string_count
+        )
 
     @property
     def dominant_type(self) -> str:
@@ -81,8 +98,10 @@ class DataTypeDistribution:
             ("int", self.int_count),
             ("float", self.float_count),
             ("date", self.date_count),
+            ("timestamp", self.timestamp_count),
             ("uuid", self.uuid_count),
             ("email", self.email_count),
+            ("enum", self.enum_count),
             ("string", self.string_count),
         ]
         return max(types, key=lambda t: t[1])[0]
@@ -187,6 +206,8 @@ def _classify_value(s: str) -> str:
     s = s.strip()
     if not s:
         return "string"
+    if _TIMESTAMP_RE.match(s):
+        return "timestamp"
     if _INT_RE.match(s):
         return "int"
     if _FLOAT_RE.match(s):
@@ -200,7 +221,7 @@ def _classify_value(s: str) -> str:
     return "string"
 
 
-def _compute_data_distribution(series: pd.Series) -> DataTypeDistribution:
+def _compute_data_distribution(series: pd.Series, detect_enum: bool = True) -> DataTypeDistribution:
     col = series.name or "unknown"
     dist = DataTypeDistribution(column=col)
     for val in series.astype(str):
@@ -211,25 +232,84 @@ def _compute_data_distribution(series: pd.Series) -> DataTypeDistribution:
             dist.float_count += 1
         elif vtype == "date":
             dist.date_count += 1
+        elif vtype == "timestamp":
+            dist.timestamp_count += 1
         elif vtype == "uuid":
             dist.uuid_count += 1
         elif vtype == "email":
             dist.email_count += 1
         else:
             dist.string_count += 1
+
+    if detect_enum and len(series) >= 5:
+        non_empty = series.astype(str).str.strip()
+        non_empty = non_empty[non_empty != ""]
+        if len(non_empty) >= 5:
+            unique_vals = non_empty.nunique()
+            total = len(non_empty)
+            if unique_vals >= 2 and unique_vals <= 20 and (unique_vals / total) <= 0.5:
+                enum_like_count = total
+                transfer_count = min(enum_like_count, dist.string_count)
+                dist.string_count -= transfer_count
+                dist.enum_count += transfer_count
+
     return dist
 
 
 def _get_memory_info() -> tuple[int, int]:
     system = platform.system()
+    machine = platform.machine().lower()
+
     try:
         import psutil
         mem = psutil.virtual_memory()
-        return int(mem.total / (1024 * 1024)), int(mem.available / (1024 * 1024))
-    except Exception:
-        if system == "Darwin":
-            with open("/usr/bin/vm_stat"):
+        total = int(mem.total / (1024 * 1024))
+        available = int(mem.available / (1024 * 1024))
+
+        if system == "Linux":
+            for cgroup_path in [
+                "/sys/fs/cgroup/memory.max",
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                "/sys/fs/cgroup/memory.high",
+            ]:
+                try:
+                    with open(cgroup_path) as f:
+                        val = f.read().strip()
+                        if val and val.isdigit() and int(val) > 0:
+                            cgroup_total = int(int(val) / (1024 * 1024))
+                            if cgroup_total < total:
+                                total = cgroup_total
+                                if hasattr(mem, "available"):
+                                    cgroup_avail = int(mem.available / (1024 * 1024))
+                                    available = min(available, cgroup_avail)
+                                break
+                except Exception:
+                    continue
+
+        if system == "Darwin" and machine in ("arm64", "aarch64"):
+            try:
+                import subprocess
+                cmd = ["sysctl", "-n", "hw.memsize"]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+                if result.returncode == 0:
+                    memsize = int(result.stdout.strip())
+                    total = int(memsize / (1024 * 1024))
+            except Exception:
                 pass
+
+        return total, available
+    except Exception:
+        try:
+            if system == "Darwin":
+                import subprocess
+                cmd = ["sysctl", "-n", "hw.memsize"]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+                if result.returncode == 0:
+                    memsize = int(result.stdout.strip())
+                    total = int(memsize / (1024 * 1024))
+                    return total, int(total * 0.5)
+        except Exception:
+            pass
         total = 16 * 1024
         available = 4 * 1024
         return total, available
@@ -370,6 +450,7 @@ def recommend_key_columns(
         return []
 
     total_rows = len(df)
+    is_small_sample = total_rows < _MIN_SAMPLE_ROWS
     weights: list[ColumnWeight] = []
 
     for col in df.columns:
@@ -380,6 +461,19 @@ def recommend_key_columns(
         avg_length = float(stripped.str.len().mean()) if total_rows else 0.0
         dist = _compute_data_distribution(series)
         data_type = dist.dominant_type
+
+        if is_small_sample:
+            score = 1.0 / max(1, len(df.columns))
+            weights.append(ColumnWeight(
+                column=col,
+                unique_ratio=unique_ratio,
+                null_ratio=null_ratio,
+                avg_length=avg_length,
+                data_type=data_type,
+                score=score,
+                is_uniform_fallback=True,
+            ))
+            continue
 
         type_bonus = 1.0
         if data_type == "uuid":
@@ -421,7 +515,8 @@ def recommend_key_columns(
             score=score,
         ))
 
-    weights.sort(key=lambda w: w.score, reverse=True)
+    if not is_small_sample:
+        weights.sort(key=lambda w: w.score, reverse=True)
     return weights[:top_n]
 
 

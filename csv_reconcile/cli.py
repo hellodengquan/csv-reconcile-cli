@@ -71,8 +71,8 @@ def compare(
         typer.echo("\u9519\u8bef: \u81f3\u5c11\u6307\u5b9a\u4e00\u4e2a\u4e3b\u5173\u952e\u5b57\u6bb5", err=True)
         raise typer.Exit(code=1)
 
-    if theme not in ("light", "dark", "solarized"):
-        typer.echo(f"\u9519\u8bef: \u4e3b\u9898\u5fc5\u987b\u662f light/dark/solarized \u4e4b\u4e00: {theme}", err=True)
+    if theme not in ("light", "dark", "solarized", "high-contrast"):
+        typer.echo(f"\u9519\u8bef: \u4e3b\u9898\u5fc5\u987b\u662f light/dark/solarized/high-contrast \u4e4b\u4e00: {theme}", err=True)
         raise typer.Exit(code=1)
 
     secondary_list: list[str] | None = None
@@ -141,9 +141,19 @@ def suggest_keys(
     table.add_column("AvgLen", justify="right")
     table.add_column("Type", style="magenta")
 
+    has_uniform = any(w.is_uniform_fallback for w in weights)
+    if has_uniform:
+        typer.echo(
+            "\u26a0\ufe0f  \u6837\u672c\u884c\u6570\u8f83\u5c11 (< 30), \u6743\u91cd\u63a8\u8350\u5df2\u9000\u56de\u5747\u5300\u5206\u914d\u3002"
+            "\u5efa\u8bae\u63d0\u4f9b\u66f4\u591a\u6570\u636e\u6216\u624b\u52a8\u6307\u5b9a\u5173\u952e\u5217\u3002"
+        )
+        typer.echo("")
+
     for i, w in enumerate(weights, 1):
         rank = f"{i:>2}"
-        if i <= primary_only:
+        if w.is_uniform_fallback:
+            rank += " \u2696\ufe0f"
+        elif i <= primary_only:
             rank += " \u2b50"
         table.add_row(
             rank,
@@ -157,6 +167,13 @@ def suggest_keys(
 
     console.print(table)
     typer.echo("")
+
+    if has_uniform:
+        typer.echo(
+            "\ud83d\udca1 \u5747\u5300\u6743\u91cd\u4e0b\u6309\u539f\u59cb\u5217\u987a\u5e8f\u63a8\u8350, "
+            "\u8bf7\u6839\u636e\u4e1a\u52a1\u77e5\u8bc6\u8c03\u6574\u5173\u952e\u5217\u9009\u62e9\u3002"
+        )
+        typer.echo("")
 
     primary = [w.column for w in weights[:primary_only]]
     secondary = [w.column for w in weights[primary_only:]]
@@ -203,6 +220,11 @@ def fix_sql(
     no_insert: bool = typer.Option(False, "--no-insert", help="\u4e0d\u751f\u6210 INSERT \u8bed\u53e5"),
     no_delete: bool = typer.Option(False, "--no-delete", help="\u4e0d\u751f\u6210 DELETE \u8bed\u53e5"),
     no_transaction: bool = typer.Option(False, "--no-transaction", help="\u4e0d\u751f\u6210 BEGIN/COMMIT \u4e8b\u52a1\u8fb9\u754c"),
+    delete_batch_size: int | None = typer.Option(
+        None,
+        "--delete-batch-size",
+        help="DELETE \u6279\u6b21\u5927\u5c0f(\u4ec5\u5355\u5217\u4e3b\u952e\u6709\u6548); \u4e0d\u8bbe\u7f6e\u5219\u6bcf\u884c\u4e00\u6761 DELETE",
+    ),
 ) -> None:
     key_list = [k.strip() for k in keys.split(",") if k.strip()]
     if not key_list:
@@ -241,6 +263,7 @@ def fix_sql(
         generate_inserts=not no_insert,
         generate_deletes=not no_delete,
         use_transaction=not no_transaction,
+        delete_batch_size=delete_batch_size,
     )
 
     if output is not None:
@@ -252,6 +275,7 @@ def fix_sql(
             generate_inserts=not no_insert,
             generate_deletes=not no_delete,
             use_transaction=not no_transaction,
+            delete_batch_size=delete_batch_size,
         )
         typer.echo(f"\u4fee\u590d SQL \u5df2\u5bfc\u51fa\u81f3: {output}")
     else:

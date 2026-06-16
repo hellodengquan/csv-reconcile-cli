@@ -3,10 +3,24 @@ set -euo pipefail
 
 DIFF_ONLY=${DIFF_ONLY:-0}
 BASE_BRANCH=${BASE_BRANCH:-main}
+SQUASH_MERGE=${SQUASH_MERGE:-0}
+
+get_changed_files() {
+    if [[ "$SQUASH_MERGE" == "1" ]]; then
+        local commits
+        commits=$(git rev-list --count HEAD 2>/dev/null || echo "1")
+        if [[ "$commits" == "1" ]] || git log --oneline -1 | grep -qi "squash"; then
+            echo "=== detected squash merge, comparing against HEAD~1" >&2
+            git diff --name-only HEAD~1 HEAD 2>/dev/null || echo ""
+            return
+        fi
+    fi
+    git diff --name-only "$BASE_BRANCH" HEAD 2>/dev/null || echo ""
+}
 
 if [[ "$DIFF_ONLY" == "1" || "${1:-}" == "--diff-only" ]]; then
     echo "=== diff-only mode: comparing against $BASE_BRANCH ==="
-    CHANGED_FILES=$(git diff --name-only "$BASE_BRANCH" HEAD 2>/dev/null || echo "")
+    CHANGED_FILES=$(get_changed_files)
     if [[ -z "$CHANGED_FILES" ]]; then
         echo "No changes detected vs $BASE_BRANCH; skipping CI gates."
         exit 0

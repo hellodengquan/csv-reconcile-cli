@@ -722,3 +722,277 @@ class TestHtmlReport:
         html = generate_html(result)
         assert "Data Type Distribution" in html
         assert "int:" in html or "float:" in html
+
+
+class TestDirectionalChars:
+    def test_normalize_removes_lrm(self) -> None:
+        s = "Hello\u200eWorld"
+        assert _normalize_value(s) == "helloworld"
+
+    def test_normalize_removes_rlm(self) -> None:
+        s = "Hello\u200fWorld"
+        assert _normalize_value(s) == "helloworld"
+
+    def test_normalize_removes_bidi_controls(self) -> None:
+        s = "\u202aLeft\u202cRight"
+        assert _normalize_value(s) == "leftright"
+
+    def test_csv_with_lrm_in_key(self, tmp_path: Path) -> None:
+        left_content = "id,name\n1001\u200e,Alice\n"
+        right_content = "id,name\n1001,Alice\n"
+        left = tmp_path / "left.csv"
+        left.write_text(left_content, encoding="utf-8")
+        right = tmp_path / "right.csv"
+        right.write_text(right_content, encoding="utf-8")
+        result = reconcile(left, right, key_columns=["id"], normalize=True)
+        assert result.summary.matched_count == 1
+
+    def test_lrm_in_value(self, tmp_path: Path) -> None:
+        left_content = "id,name\n1,Alice\u200e\n"
+        right_content = "id,name\n1,Alice\n"
+        left = tmp_path / "left.csv"
+        left.write_text(left_content, encoding="utf-8")
+        right = tmp_path / "right.csv"
+        right.write_text(right_content, encoding="utf-8")
+        result = reconcile(left, right, key_columns=["id"], normalize=True)
+        assert result.summary.matched_count == 1
+
+
+class TestTimestampAndEnumTypes:
+    def test_timestamp_10_digit(self) -> None:
+        from csv_reconcile.engine import _classify_value
+        assert _classify_value("1717209600") == "timestamp"
+
+    def test_timestamp_13_digit(self) -> None:
+        from csv_reconcile.engine import _classify_value
+        assert _classify_value("1717209600000") == "timestamp"
+
+    def test_enum_detection(self, tmp_path: Path) -> None:
+        import pandas as pd
+
+        content = """\
+id,status,category
+1,PENDING,A
+2,APPROVED,B
+3,PENDING,A
+4,REJECTED,C
+5,APPROVED,A
+6,PENDING,B
+7,REJECTED,A
+8,APPROVED,A
+9,PENDING,C
+10,REJECTED,B
+"""
+        p = _write_csv(tmp_path, "data.csv", content)
+        from csv_reconcile.engine import _compute_data_distribution
+
+        df = pd.read_csv(p, dtype=str)
+        dist = _compute_data_distribution(df["status"])
+        assert dist.enum_count > 0 or dist.string_count > 0
+
+    def test_enum_dominant_type(self, tmp_path: Path) -> None:
+        content = """\
+id,grade
+1,A
+2,B
+3,A
+4,C
+5,B
+6,A
+7,A
+8,B
+9,C
+10,A
+"""
+        p = _write_csv(tmp_path, "data.csv", content)
+        weights = recommend_key_columns(p, top_n=2)
+        grade_weight = next(w for w in weights if w.column == "grade")
+        assert grade_weight.data_type in ("enum", "string")
+
+    def test_timestamp_in_distribution(self, tmp_path: Path) -> None:
+        content = """\
+id,ts
+1,1717209600
+2,1717209700
+3,1717209800
+"""
+        p = _write_csv(tmp_path, "data.csv", content)
+        weights = recommend_key_columns(p, top_n=2)
+        ts_weight = next(w for w in weights if w.column == "ts")
+        assert ts_weight.data_type in ("timestamp", "int")
+
+
+class TestSmallSampleFallback:
+    def test_small_sample_uniform_weights(self, tmp_path: Path) -> None:
+        rows = []
+        rows.append("id,name,email,score")
+        for i in range(10):
+            rows.append(f"{i + 1},User{i},u{i}@x.com,{80 + i}")
+        content = "\n".join(rows) + "\n"
+        p = _write_csv(tmp_path, "small.csv", content)
+        weights = recommend_key_columns(p, top_n=4)
+        assert len(weights) == 4
+        for w in weights:
+            assert w.is_uniform_fallback is True
+            assert abs(w.score - 0.25) < 0.001
+
+    def test_small_sample_preserves_column_order(self, tmp_path: Path) -> None:
+        rows = ["col_z,col_a,col_m,col_b"]
+        for i in range(5):
+            rows.append(f"{i},{i},{i},{i}")
+        content = "\n".join(rows) + "\n"
+        p = _write_csv(tmp_path, "small.csv", content)
+        weights = recommend_key_columns(p, top_n=4)
+        assert [w.column for w in weights] == ["col_z", "col_a", "col_m", "col_b"]
+
+    def test_large_sample_no_fallback(self, tmp_path: Path) -> None:
+        rows = ["id,name,score"]
+        for i in range(50):
+            rows.append(f"{i + 1},User{i},{80 + (i % 20)}")
+        content = "\n".join(rows) + "\n"
+        p = _write_csv(tmp_path, "large.csv", content)
+        weights = recommend_key_columns(p, top_n=3)
+        for w in weights:
+            assert w.is_uniform_fallback is False
+        assert weights[0].column == "id"
+        assert weights[0].score > weights[1].score
+
+
+class TestQuotedNestedQuotesMultiLine:
+    def test_multiline_nested_quotes(self, tmp_path: Path) -> None:
+        left_content = (
+            'order_id,description\n'
+            '1001,"""line1\n'
+            'line2\n'
+            'line3"""\n'
+        )
+        right_content = (
+            'order_id,description\n'
+            '1001,"""line1\n'
+            'line2\n'
+            'line3"""\n'
+        )
+        left = tmp_path / "left.csv"
+        left.write_text(left_content, encoding="utf-8")
+        right = tmp_path / "right.csv"
+        right.write_text(right_content, encoding="utf-8")
+        result = reconcile(left, right, key_columns=["order_id"])
+        assert result.summary.matched_count == 1
+
+    def test_multiline_nested_quotes_mismatch(self, tmp_path: Path) -> None:
+        left_content = (
+            'order_id,description\n'
+            '1001,"""hello\n'
+            'world"""\n'
+        )
+        right_content = (
+            'order_id,description\n'
+            '1001,"""hi\n'
+            'world"""\n'
+        )
+        left = tmp_path / "left.csv"
+        left.write_text(left_content, encoding="utf-8")
+        right = tmp_path / "right.csv"
+        right.write_text(right_content, encoding="utf-8")
+        result = reconcile(left, right, key_columns=["order_id"])
+        assert result.summary.diff_count == 1
+        assert "hello" in result.row_diffs[0].diffs[0].left_value
+
+    def test_mixed_quotes_and_newlines(self, tmp_path: Path) -> None:
+        left_content = (
+            'id,notes\n'
+            '1,"He said: ""I\n'
+            'love\n'
+            'CSV"""\n'
+        )
+        right_content = left_content
+        left = tmp_path / "left.csv"
+        left.write_text(left_content, encoding="utf-8")
+        right = tmp_path / "right.csv"
+        right.write_text(right_content, encoding="utf-8")
+        result = reconcile(left, right, key_columns=["id"])
+        assert result.summary.matched_count == 1
+
+
+class TestDeleteBatching:
+    def test_delete_batch_single_column_key(self, tmp_path: Path) -> None:
+        left_rows = ["id,name"]
+        for i in range(10):
+            left_rows.append(f"{i + 1},User{i + 1}")
+        left_content = "\n".join(left_rows) + "\n"
+        right_content = "id,name\n1,User1\n"
+        left = _write_csv(tmp_path, "left.csv", left_content)
+        right = _write_csv(tmp_path, "right.csv", right_content)
+        result = reconcile(left, right, key_columns=["id"])
+        sql = generate_fix_sql(
+            result, "users", ["id"], delete_batch_size=3, use_transaction=False
+        )
+        assert "WHERE id IN (" in sql
+        assert sql.count("DELETE FROM users") == 3
+
+    def test_delete_batch_size_none(self, tmp_path: Path) -> None:
+        left_content = "id,name\n1,Alice\n2,Bob\n3,Charlie\n"
+        right_content = "id,name\n1,Alice\n"
+        left = _write_csv(tmp_path, "left.csv", left_content)
+        right = _write_csv(tmp_path, "right.csv", right_content)
+        result = reconcile(left, right, key_columns=["id"])
+        sql = generate_fix_sql(
+            result, "users", ["id"], delete_batch_size=None, use_transaction=False
+        )
+        assert "WHERE id = '2'" in sql
+        assert "WHERE id = '3'" in sql
+        assert "IN (" not in sql
+
+    def test_delete_batch_multiple_column_key(self, tmp_path: Path) -> None:
+        left_content = "order_id,item_id,name\n1,1,Apple\n1,2,Banana\n"
+        right_content = "order_id,item_id,name\n1,1,Apple\n"
+        left = _write_csv(tmp_path, "left.csv", left_content)
+        right = _write_csv(tmp_path, "right.csv", right_content)
+        result = reconcile(left, right, key_columns=["order_id", "item_id"])
+        sql = generate_fix_sql(
+            result, "order_items", ["order_id", "item_id"],
+            delete_batch_size=100, use_transaction=False,
+        )
+        assert "WHERE order_id = '1' AND item_id = '2'" in sql
+        assert "IN (" not in sql
+
+    def test_delete_batch_note_in_comment(self, tmp_path: Path) -> None:
+        left_content = "id,name\n1,Alice\n2,Bob\n3,Charlie\n"
+        right_content = "id,name\n1,Alice\n"
+        left = _write_csv(tmp_path, "left.csv", left_content)
+        right = _write_csv(tmp_path, "right.csv", right_content)
+        result = reconcile(left, right, key_columns=["id"])
+        sql = generate_fix_sql(
+            result, "users", ["id"], delete_batch_size=10, use_transaction=False
+        )
+        assert "(batched 10)" in sql
+
+
+class TestHighContrastTheme:
+    def test_generate_html_high_contrast(self, tmp_path: Path) -> None:
+        left = _write_csv(tmp_path, "left.csv", BASIC_LEFT)
+        right = _write_csv(tmp_path, "right.csv", BASIC_RIGHT)
+        result = reconcile(left, right, key_columns=["order_id", "item_id"])
+        html = generate_html(result, theme="high-contrast")
+        assert "#000000" in html
+        assert "#00ff00" in html
+        assert "#ff0000" in html
+
+    def test_high_contrast_button(self, tmp_path: Path) -> None:
+        left = _write_csv(tmp_path, "left.csv", BASIC_LEFT)
+        right = _write_csv(tmp_path, "right.csv", BASIC_RIGHT)
+        result = reconcile(left, right, key_columns=["order_id", "item_id"])
+        html = generate_html(result)
+        assert 'data-theme="high-contrast"' in html
+        assert "High Contrast" in html
+
+
+class TestMemoryInfoEnhanced:
+    def test_memory_info_returns_tuple(self) -> None:
+        from csv_reconcile.engine import _get_memory_info
+        total, available = _get_memory_info()
+        assert isinstance(total, int)
+        assert isinstance(available, int)
+        assert total > 0
+        assert available > 0
+        assert available <= total

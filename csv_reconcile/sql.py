@@ -46,14 +46,29 @@ def _generate_delete_statements(
     rows: list[dict[str, str]],
     table_name: str,
     key_columns: list[str],
+    batch_size: int | None = None,
 ) -> list[str]:
     statements: list[str] = []
-    for row in rows:
-        where_parts = " AND ".join(
-            f"{col} = '{_sql_escape(row[col])}'" for col in key_columns if col in row
-        )
-        sql = f"DELETE FROM {table_name} WHERE {where_parts};"
-        statements.append(sql)
+    if not rows:
+        return statements
+
+    if batch_size is None or len(key_columns) != 1:
+        for row in rows:
+            where_parts = " AND ".join(
+                f"{col} = '{_sql_escape(row[col])}'" for col in key_columns if col in row
+            )
+            sql = f"DELETE FROM {table_name} WHERE {where_parts};"
+            statements.append(sql)
+    else:
+        key_col = key_columns[0]
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i:i + batch_size]
+            values = [f"'{_sql_escape(row[key_col])}'" for row in batch if key_col in row]
+            if values:
+                in_clause = ", ".join(values)
+                sql = f"DELETE FROM {table_name} WHERE {key_col} IN ({in_clause});"
+                statements.append(sql)
+
     return statements
 
 
@@ -64,6 +79,7 @@ def generate_fix_sql(
     generate_inserts: bool = True,
     generate_deletes: bool = True,
     use_transaction: bool = True,
+    delete_batch_size: int | None = None,
 ) -> str:
     parts: list[str] = []
 
@@ -85,9 +101,14 @@ def generate_fix_sql(
             parts.append("")
 
     if generate_deletes and result.left_only:
-        delete_stmts = _generate_delete_statements(result.left_only, table_name, key_columns)
+        delete_stmts = _generate_delete_statements(
+            result.left_only, table_name, key_columns, delete_batch_size
+        )
         if delete_stmts:
-            parts.append("-- DELETE: remove rows only in left table")
+            batch_note = ""
+            if delete_batch_size is not None and len(key_columns) == 1:
+                batch_note = f" (batched {delete_batch_size})"
+            parts.append(f"-- DELETE: remove rows only in left table{batch_note}")
             parts.extend(delete_stmts)
             parts.append("")
 
@@ -108,6 +129,7 @@ def export_fix_sql(
     generate_inserts: bool = True,
     generate_deletes: bool = True,
     use_transaction: bool = True,
+    delete_batch_size: int | None = None,
 ) -> None:
     sql = generate_fix_sql(
         result,
@@ -116,6 +138,7 @@ def export_fix_sql(
         generate_inserts,
         generate_deletes,
         use_transaction,
+        delete_batch_size,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(sql, encoding="utf-8")

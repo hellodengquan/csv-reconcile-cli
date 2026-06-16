@@ -64,6 +64,25 @@ THEMES: dict[str, dict[str, str]] = {
         "primary": "#268bd2",
         "primary_fg": "#fdf6e3",
     },
+    "high-contrast": {
+        "bg": "#000000",
+        "fg": "#ffffff",
+        "muted": "#ffffff",
+        "border": "#ffffff",
+        "header_bg": "#000000",
+        "diff_add_bg": "#000000",
+        "diff_add_fg": "#00ff00",
+        "diff_del_bg": "#000000",
+        "diff_del_fg": "#ff0000",
+        "success": "#00ff00",
+        "warning": "#ffff00",
+        "danger": "#ff0000",
+        "info": "#00ffff",
+        "table_bg": "#000000",
+        "row_alt_bg": "#1a1a1a",
+        "primary": "#ffffff",
+        "primary_fg": "#000000",
+    },
 }
 
 
@@ -264,6 +283,7 @@ def generate_html(
         <button class="theme-btn {"active" if theme == "light" else ""}" data-theme="light">Light</button>
         <button class="theme-btn {"active" if theme == "dark" else ""}" data-theme="dark">Dark</button>
         <button class="theme-btn {"active" if theme == "solarized" else ""}" data-theme="solarized">Solarized</button>
+        <button class="theme-btn {"active" if theme == "high-contrast" else ""}" data-theme="high-contrast">High Contrast</button>
     </div>
     <div class="stats-grid">
         <div class="stat-card">

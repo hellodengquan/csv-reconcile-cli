@@ -26,7 +26,7 @@ def _fmt_distribution(dist) -> str:  # type: ignore[no-untyped-def]
         return "-"
     total = max(1, dist.total)
     parts: list[str] = []
-    for tname in ["int", "float", "date", "uuid", "email", "string"]:
+    for tname in ["int", "float", "date", "timestamp", "uuid", "email", "enum", "string"]:
         cnt = getattr(dist, f"{tname}_count")
         if cnt > 0:
             parts.append(f"[magenta]{tname}[/magenta]:{cnt / total * 100:.1f}%")
